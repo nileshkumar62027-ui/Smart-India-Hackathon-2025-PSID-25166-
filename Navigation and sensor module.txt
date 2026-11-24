@@ -1,0 +1,223 @@
+#include <TinyGPS++.h>
+
+// ================= PINS =================
+#define READY_LED 4    // Green LED
+#define BUZZER_PIN 12  // Alarm Buzzer
+
+// L298N Motors
+#define ENA 10 // Right PWM
+#define IN1 9
+#define IN2 8
+#define ENB 5  // Left PWM
+#define IN3 7
+#define IN4 6
+
+// Sensors
+#define PH_PIN A0
+#define TURB_PIN A1
+
+// ================= CONFIGURATION =================
+// SPEED SETTINGS (0 to 255)
+// Increased as requested (Max is 255)
+int TURN_SPEED = 180;     
+int FORWARD_SPEED = 200;
+int PATROL_SPEED = 150;   
+int DEADBAND = 15;        
+
+// PATROL TIMING
+const unsigned long MOVE_TIME = 10000; // 10 Seconds Straight
+const unsigned long STOP_TIME = 1000;  // 1 Second Pause
+const unsigned long SPIN_TIME = 4000;  // ~4 Seconds for 360 Spin (Tune this!)
+
+// SAFETY
+const unsigned long SAFETY_TIMEOUT = 1500; // Stop if no command for 1.5s
+
+String apn = "www";                 
+String apiKey = "5KG2CNCWI5PVZYGT"; 
+const long uploadInterval = 10000; 
+
+// ================= GLOBALS =================
+enum State { IDLE, P_FORWARD, P_STOP_1, P_SPIN, P_STOP_2 };
+State currentState = IDLE;
+unsigned long stateStartTime = 0;
+unsigned long lastCommandTime = 0; // For Failsafe
+
+TinyGPSPlus gps;
+String inputString = "";
+boolean stringComplete = false;
+unsigned long lastUploadTime = 0;
+
+void setup() {
+  Serial.begin(115200);   // Jetson
+  Serial1.begin(9600);    // SIM
+  Serial2.begin(9600);    // GPS
+
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  
+  pinMode(READY_LED, OUTPUT); digitalWrite(READY_LED, LOW); 
+  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);
+
+  initSIM();
+  stopMotors();
+  Serial.println("Aquabot Mega Initialized.");
+}
+
+void loop() {
+  // 1. SAFETY CHECK (Failsafe)
+  // If Jetson stops sending data (Crash/Unplugged), STOP MOTORS.
+  // Exception: If we are actively Patrolling, we might want to continue, 
+  // but usually it's safer to stop if the Brain dies.
+  if (millis() - lastCommandTime > SAFETY_TIMEOUT) {
+    stopMotors();
+    digitalWrite(READY_LED, LOW); // Turn off Green LED
+  }
+
+  // 2. Read Navigation Data
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+
+  // 3. Patrol Logic (Only if IDLE/Searching)
+  handlePatrolLoop();
+
+  // 4. Sensors
+  while (Serial2.available() > 0) gps.encode(Serial2.read());
+  
+  if (millis() - lastUploadTime > uploadInterval) {
+    lastUploadTime = millis();
+    performUpload();
+  }
+}
+
+// ================= COMMAND LOGIC =================
+void processCommand(String data) {
+  lastCommandTime = millis(); // Update heartbeat
+
+  // Check for System Ready
+  if (data.indexOf("STATUS:READY") != -1) {
+    digitalWrite(READY_LED, HIGH);
+    return;
+  }
+
+  int xIndex = data.indexOf("X:");
+  int dIndex = data.indexOf("D:");
+  int commaIndex = data.indexOf(",");
+  
+  if (xIndex != -1 && dIndex != -1) {
+    int turn = data.substring(xIndex + 2, commaIndex).toInt();
+    int dist = data.substring(dIndex + 2).toInt();
+
+    // --- EMERGENCY ALARM ---
+    if (dist == 999) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      stopMotors();
+      currentState = IDLE; // Cancel Patrol
+      Serial.println("ALARM: DROWNING!");
+      return; 
+    } 
+    else {
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    // --- NAVIGATION ---
+    if (dist > 0) {
+      // TRASH SEEN -> CANCEL PATROL IMMEDIATELY
+      currentState = IDLE;
+      
+      if (dist == 101) moveForward(FORWARD_SPEED); // Push
+      else if (abs(turn) > DEADBAND) {
+        if (turn < 0) turnLeft(); else turnRight();
+      }
+      else moveForward(FORWARD_SPEED);
+      
+    } else {
+      // NO TRASH -> START PATROL
+      // Only start if we aren't already patrolling
+      if (currentState == IDLE) changeState(P_FORWARD);
+    }
+    
+    // Debug Echo
+    Serial.print("ACK: T="); Serial.print(turn);
+    Serial.print(" D="); Serial.println(dist);
+  }
+}
+
+// ================= PATROL LOGIC =================
+void handlePatrolLoop() {
+  if (currentState == IDLE) return;
+  
+  // If Failsafe triggered (Jetson died), Force IDLE
+  if (millis() - lastCommandTime > SAFETY_TIMEOUT) {
+      currentState = IDLE;
+      return;
+  }
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  switch (currentState) {
+    case P_FORWARD:
+      // MOVE 10 SECONDS STRAIGHT
+      moveForward(PATROL_SPEED);
+      if (elapsed > MOVE_TIME) changeState(P_STOP_1);
+      break;
+
+    case P_STOP_1:
+      stopMotors();
+      if (elapsed > STOP_TIME) changeState(P_SPIN);
+      break;
+
+    case P_SPIN:
+      // ROTATE 360
+      spinLeft(PATROL_SPEED);
+      if (elapsed > SPIN_TIME) changeState(P_STOP_2);
+      break;
+
+    case P_STOP_2:
+      stopMotors();
+      if (elapsed > STOP_TIME) changeState(P_FORWARD); // REPEAT
+      break;
+  }
+}
+
+void changeState(State newState) {
+  currentState = newState;
+  stateStartTime = millis();
+}
+
+// ================= DRIVERS =================
+void moveForward(int s) {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, s);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, s);
+}
+void turnLeft() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, TURN_SPEED);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, TURN_SPEED);
+}
+void turnRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, TURN_SPEED);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, TURN_SPEED);
+}
+void spinLeft(int s) {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, s);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, s);
+}
+void stopMotors() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); analogWrite(ENA, 0);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); analogWrite(ENB, 0);
+}
+
+// ================= CLOUD =================
+void performUpload() {
+  float ph = readPH(); float turb = readTurbidity();
+  double lat = (gps.location.isValid()) ? gps.location.lat() : 0.0;
+  double lng = (gps.location.isValid()) ? gps.location.lng() : 0.0;
+  uploadToThingSpeak(ph, turb, lat, lng);
+}
+float readPH() { long s=0; for(int i=0; i<10; i++) { s+=analogRead(PH_PIN); delay(5); } float v=(float)s*5.0/10240; return 7.00+((2.5-v)/0.18); }
+float readTurbidity() { float v=0; for(int i=0; i<10; i++) { v+=((float)analogRead(TURB_PIN)/1023)*5; delay(5); } v=v/10; if(v<2.5) return 3000; if(v>4.2) return 0; return -1120.4*square(v)+5742.3*v-4353.8; }
+void initSIM() { Serial1.println("AT"); delay(1000); Serial1.println("AT+CIPSHUT"); delay(1000); Serial1.println("AT+CIPMUX=0"); delay(1000); Serial1.print("AT+CSTT=\""); Serial1.print(apn); Serial1.println("\",\"\",\"\""); delay(1000); Serial1.println("AT+CIICR"); delay(2000); Serial1.println("AT+CIFSR"); delay(1000); }
+void uploadToThingSpeak(float ph, float turb, double lat, double lng) { Serial1.println("AT+CIPSTART=\"TCP\",\"api.thingspeak.com\",\"80\""); delay(2000); String url = "GET /update?api_key=" + apiKey + "&field1=" + String(ph) + "&field2=" + String(turb) + "&field5=" + String(lat, 6) + "&field6=" + String(lng, 6); String cmd = url + "\r\n"; Serial1.print("AT+CIPSEND="); Serial1.println(cmd.length()); delay(500); Serial1.print(cmd); delay(500); Serial1.println("AT+CIPCLOSE"); }
+void serialEvent() { while (Serial.available()) { char inChar = (char)Serial.read(); inputString += inChar; if (inChar == '\n') stringComplete = true; } }

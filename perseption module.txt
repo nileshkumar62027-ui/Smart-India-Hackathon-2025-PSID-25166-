@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# =========================================================================
+#  AQUABOT MAIN SYSTEM - JETSON NANO
+#  Features: Dual AI (PoseNet + YOLO), Navigation, Telemetry, Safety
+# =========================================================================
+
+import cv2
+import jetson.inference
+import jetson.utils
+import numpy as np
+import sys
+import time
+import math
+import requests
+import serial
+
+# ================= CONFIGURATION =================
+# Cloud Telemetry (ThingSpeak)
+WRITE_API_KEY = "5KG2CNCWI5PVZYGT"
+BASE_URL = "https://api.thingspeak.com/update"
+UPLOAD_INTERVAL = 16  # Seconds (ThingSpeak needs ~15s delay)
+
+# Hardware Settings
+SERIAL_PORT = "/dev/ttyACM0"  # Check: might be /dev/ttyUSB0
+BAUD_RATE = 115200
+
+# AI Models
+POSE_MODEL = "resnet18-body"
+YOLO_PATH = "/home/swades/best.onnx" 
+
+# Logic Thresholds
+COLLECTION_LINE_Y = 400       # Y-pixel line to count 'collected'
+COLLECTION_COOLDOWN = 2.0     # Seconds between counts
+GARBAGE_SKIP_FRAMES = 5       # Run YOLO every 5 frames (CPU opt)
+CONFIDENCE_THRESHOLD = 0.4    # Minimum confidence for trash
+SCORE_THRESHOLD = 0.25        # NMS threshold for boxes
+
+# Drowning AI Globals (Advanced Logic)
+POSE_BUFFER = []
+BUFFER_SIZE = 15              # Analyze last ~1.5 seconds of motion
+RISK_THRESHOLD = 60           # Score to trigger drowning alarm
+
+# ================= SERIAL COMMUNICATION =================
+ser = None
+
+def init_serial():
+    global ser
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        print(f" >> SUCCESS: Connected to Arduino on {SERIAL_PORT}")
+    except Exception as e:
+        print(f" !! WARNING: Arduino connect failed ({e}). Running in Simulation.")
+
+def communicate_with_arduino(turn_val, dist_val):
+    """
+    Sends navigation command to Arduino.
+    Format: "X:turn_val,D:dist_val\n"
+    """
+    if ser and ser.is_open:
+        cmd = f"X:{int(turn_val)},D:{int(dist_val)}\n"
+        ser.write(cmd.encode('utf-8'))
+        
+        # Read and clear buffer to prevent lag
+        try:
+            while ser.in_waiting > 0:
+                ser.readline()
+        except: pass
+
+def send_ready_signal():
+    """Tells Arduino that AI is loaded (Turns on Green LED)"""
+    print(" >> AI LOADED! Sending Ready Signal to Arduino...")
+    if ser and ser.is_open:
+        ser.write("STATUS:READY\n".encode('utf-8'))
+        time.sleep(0.5)
+        ser.write("STATUS:READY\n".encode('utf-8'))
+
+# ================= AI LOGIC: DROWNING =================
+def calc_dist(p1, p2):
+    return math.hypot(p2.x - p1.x, p2.y - p1.y)
+
+def calc_angle(shoulder, hip):
+    # 0=Vertical (Drowning/Standing), 90=Horizontal (Swimming)
+    dx = abs(shoulder.x - hip.x)
+    dy = abs(shoulder.y - hip.y)
+    if dy == 0: return 90 
+    return math.degrees(math.atan(dx / dy)) 
+
+def analyze_drowning_advanced(poses):
+    """
+    Calculates a Risk Score based on:
+    1. Thrashing Speed
+    2. Body Angle (Vertical vs Horizontal)
+    3. Head Bobbing
+    4. Instant Panic (Hands above head)
+    """
+    global POSE_BUFFER
+    
+    if not poses:
+        if len(POSE_BUFFER) > 0: POSE_BUFFER.pop(0)
+        return False
+
+    pose = poses[0]
+    # Keypoints: 0:Nose, 6:R-Shoulder, 10:R-Wrist, 12:R-Hip
+    n_idx = pose.FindKeypoint(0); s_idx = pose.FindKeypoint(6)
+    w_idx = pose.FindKeypoint(10); h_idx = pose.FindKeypoint(12)
+    
+    if n_idx < 0 or s_idx < 0 or w_idx < 0 or h_idx < 0: return False
+
+    current_data = {
+        'nose': pose.Keypoints[n_idx], 'shoulder': pose.Keypoints[s_idx],
+        'wrist': pose.Keypoints[w_idx], 'hip': pose.Keypoints[h_idx]
+    }
+    POSE_BUFFER.append(current_data)
+    
+    # Maintain buffer size
+    if len(POSE_BUFFER) > BUFFER_SIZE: POSE_BUFFER.pop(0)
+    if len(POSE_BUFFER) < BUFFER_SIZE: return False
+
+    # --- Risk Scoring ---
+    risk_score = 0
+    
+    # 1. Thrashing Speed
+    total_movement = 0
+    for i in range(1, len(POSE_BUFFER)):
+        total_movement += calc_dist(POSE_BUFFER[i-1]['wrist'], POSE_BUFFER[i]['wrist'])
+    if (total_movement / len(POSE_BUFFER)) > 10: risk_score += 30
+        
+    # 2. Body Angle
+    angle = calc_angle(POSE_BUFFER[-1]['shoulder'], POSE_BUFFER[-1]['hip'])
+    if angle < 30: risk_score += 20    # Vertical
+    elif angle > 60: risk_score -= 30  # Horizontal
+        
+    # 3. Head Bobbing
+    bob_count = 0
+    shoulder_height = sum([f['shoulder'].y for f in POSE_BUFFER]) / len(POSE_BUFFER)
+    for i in range(1, len(POSE_BUFFER)):
+        curr_y = POSE_BUFFER[i]['nose'].y; prev_y = POSE_BUFFER[i-1]['nose'].y
+        if (prev_y < shoulder_height and curr_y > shoulder_height) or \
+           (prev_y > shoulder_height and curr_y < shoulder_height):
+            bob_count += 1
+    if bob_count >= 2: risk_score += 30
+        
+    # 4. Instant Panic (Hands High)
+    if POSE_BUFFER[-1]['wrist'].y < POSE_BUFFER[-1]['nose'].y: risk_score += 20
+
+    return risk_score > RISK_THRESHOLD
+
+# ================= AI LOGIC: GARBAGE (YOLO) =================
+def process_yolo(net, image):
+    """
+    Runs YOLOv8 on CPU.
+    """
+    # CPU Mode for Stability
+    blob = cv2.dnn.blobFromImage(image, 1/255.0, (640, 640), swapRB=True, crop=False)
+    net.setInput(blob)
+    outputs = net.forward()
+    outputs = np.array([cv2.transpose(outputs[0])])
+    boxes = []; scores = []
+    rows = outputs.shape[1]
+    h, w = image.shape[:2]
+    xf = w / 640; yf = h / 640
+
+    for i in range(rows):
+        classes_scores = outputs[0][i][4:]
+        minScore, maxScore, minClassLoc, (x, maxClassIndex) = cv2.minMaxLoc(classes_scores)
+        if maxScore >= CONFIDENCE_THRESHOLD:
+            box = outputs[0][i][0:4]
+            left = int((box[0] - 0.5 * box[2]) * xf); top = int((box[1] - 0.5 * box[3]) * yf)
+            width = int(box[2] * xf); height = int(box[3] * yf)
+            boxes.append([left, top, width, height])
+            scores.append(float(maxScore))
+    
+    indices = cv2.dnn.NMSBoxes(boxes, scores, SCORE_THRESHOLD, 0.45)
+    final = []
+    if len(indices) > 0:
+        for i in indices.flatten(): final.append(boxes[i])
+    return final
+
+def send_data_to_cloud(drowning_status, garbage_count):
+    try:
+        payload = {'api_key': WRITE_API_KEY, 'field3': drowning_status, 'field4': garbage_count}
+        requests.get(BASE_URL, params=payload, timeout=0.2)
+    except: pass
+
+# ================= MAIN APPLICATION LOOP =================
+def main():
+    print("\n=== AQUABOT SYSTEM LAUNCHING ===")
+    init_serial()
+
+    print("Loading PoseNet (GPU)...")
+    net_pose = jetson.inference.poseNet(POSE_MODEL, sys.argv, 0.15)
+    
+    print("Loading YOLO (CPU Mode)...")
+    net_yolo = cv2.dnn.readNetFromONNX(YOLO_PATH)
+    # Important: Force CPU to avoid memory conflicts
+    net_yolo.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    net_yolo.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+    cap = cv2.VideoCapture(0)
+    cap.set(3, 640)
+    cap.set(4, 480)
+
+    # Indicate System Ready (Green LED on Arduino)
+    send_ready_signal()
+
+    frame_count = 0
+    detected_trash = []
+    nav_turn = 0; nav_dist = 0
+    collected_count = 0
+    last_collection_time = 0
+    last_upload_time = 0
+
+    print("SYSTEM LIVE! Press 'q' to quit.\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+        
+        center_x = 320 
+
+        # --- PRIORITY 1: DROWNING CHECK (Every Frame) ---
+        frame_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+        cuda_img = jetson.utils.cudaFromNumpy(frame_rgba)
+        poses = net_pose.Process(cuda_img, overlay="none")
+        is_drowning = analyze_drowning_advanced(poses)
+
+        if is_drowning:
+            # EMERGENCY: Stop everything, Sound Alarm
+            # Send Turn=0, Dist=999 (Code for Alarm)
+            communicate_with_arduino(0, 999) 
+            cv2.putText(frame, "!!! DROWNING ALARM !!!", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
+
+        # --- PRIORITY 2: GARBAGE CHECK (Only If Safe) ---
+        else:
+            if frame_count % GARBAGE_SKIP_FRAMES == 0:
+                detected_trash = process_yolo(net_yolo, frame)
+                
+                if len(detected_trash) > 0:
+                    # Find Best Target (Closest / Lowest Y)
+                    detected_trash.sort(key=lambda b: b[1] + b[3], reverse=True)
+                    target = detected_trash[0]
+                    x, y, w, h = target
+                    
+                    # Target Visuals
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
+                    cv2.putText(frame, "TARGET", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    
+                    # Calc Steering (-100 Left, +100 Right)
+                    obj_center_x = x + (w // 2)
+                    error_x = obj_center_x - center_x
+                    nav_turn = int((error_x / center_x) * 100)
+                    
+                    # Calc Distance (0 Far, 100 Close)
+                    obj_bottom_y = y + h
+                    nav_dist = int(((obj_bottom_y - 240) / 240) * 100)
+                    nav_dist = max(0, min(100, nav_dist)) 
+                    
+                    # Collection Event (Virtual Line)
+                    if obj_bottom_y > COLLECTION_LINE_Y:
+                        nav_dist = 101 # Push Command
+                        if (time.time() - last_collection_time) > COLLECTION_COOLDOWN:
+                            collected_count += 1
+                            last_collection_time = time.time()
+                            print(f" >> TRASH COLLECTED! Total: {collected_count}")
+                    
+                    communicate_with_arduino(nav_turn, nav_dist)
+                else:
+                    # No Trash -> Arduino Start Patrol Mode
+                    communicate_with_arduino(0, 0)
+        
+        frame_count += 1
+
+        # --- VISUALIZATION ---
+        color = (0, 255, 0) if (time.time() - last_collection_time > COLLECTION_COOLDOWN) else (0, 0, 255)
+        cv2.line(frame, (0, COLLECTION_LINE_Y), (640, COLLECTION_LINE_Y), color, 2)
+
+        for pose in poses:
+            for link in pose.Links:
+                k1 = pose.Keypoints[link[0]]; k2 = pose.Keypoints[link[1]]
+                cv2.line(frame, (int(k1.x), int(k1.y)), (int(k2.x), int(k2.y)), (0, 255, 0), 2)
+
+        # Draw Other Trash
+        for box in detected_trash:
+            x, y, w, h = box
+            if len(detected_trash) > 0 and box == detected_trash[0]: continue
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 165, 255), 2)
+
+        status_text = "DROWNING!" if is_drowning else "SCANNING"
+        c_stat = (0, 0, 255) if is_drowning else (0, 255, 0)
+        cv2.putText(frame, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, c_stat, 2)
+        cv2.putText(frame, f"Collected: {collected_count}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        # --- CLOUD UPLOAD ---
+        if (time.time() - last_upload_time) > UPLOAD_INTERVAL:
+            if is_drowning or collected_count > 0:
+                send_data_to_cloud(1 if is_drowning else 0, collected_count)
+                last_upload_time = time.time()
+
+        # Disable display if running completely headless to save resources
+        # cv2.imshow("Aquabot Final", frame)
+        # if cv2.waitKey(1) == ord('q'): break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
